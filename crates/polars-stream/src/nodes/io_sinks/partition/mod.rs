@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -9,9 +8,11 @@ use polars_core::schema::SchemaRef;
 use polars_error::PolarsResult;
 use polars_io::cloud::CloudOptions;
 use polars_plan::dsl::{
-    FileType, PartitionTargetCallback, PartitionTargetContext, SinkOptions, SinkTarget,
+    FileType, PartitionTargetCallback, PartitionTargetCallbackResult, PartitionTargetContext,
+    SinkOptions, SinkTarget,
 };
 use polars_utils::format_pl_smallstr;
+use polars_utils::plpath::PlPathRef;
 
 use super::{DEFAULT_SINK_DISTRIBUTOR_BUFFER_SIZE, SinkInputPort, SinkNode};
 use crate::async_executor::{AbortOnDropHandle, spawn};
@@ -36,9 +37,8 @@ pub struct PerPartitionSortBy {
     pub maintain_order: bool,
 }
 
-pub type CreateNewSinkFn = Arc<
-    dyn Send + Sync + Fn(SchemaRef, SinkTarget) -> PolarsResult<Box<dyn SinkNode + Send + Sync>>,
->;
+pub type CreateNewSinkFn =
+    Arc<dyn Send + Sync + Fn(SchemaRef, SinkTarget) -> PolarsResult<Box<dyn SinkNode + Send>>>;
 
 pub fn get_create_new_fn(
     file_type: FileType,
@@ -55,7 +55,7 @@ pub fn get_create_new_fn(
                 sink_options.clone(),
                 ipc_writer_options,
                 cloud_options.clone(),
-            )) as Box<dyn SinkNode + Send + Sync>;
+            )) as Box<dyn SinkNode + Send>;
             Ok(sink)
         }) as _,
         #[cfg(feature = "json")]
@@ -64,7 +64,7 @@ pub fn get_create_new_fn(
                 target,
                 sink_options.clone(),
                 cloud_options.clone(),
-            )) as Box<dyn SinkNode + Send + Sync>;
+            )) as Box<dyn SinkNode + Send>;
             Ok(sink)
         }) as _,
         #[cfg(feature = "parquet")]
@@ -77,7 +77,7 @@ pub fn get_create_new_fn(
                     &parquet_writer_options,
                     cloud_options.clone(),
                     collect_metrics,
-                )?) as Box<dyn SinkNode + Send + Sync>;
+                )?) as Box<dyn SinkNode + Send>;
                 Ok(sink)
             }) as _
         },
@@ -89,7 +89,7 @@ pub fn get_create_new_fn(
                 sink_options.clone(),
                 csv_writer_options.clone(),
                 cloud_options.clone(),
-            )) as Box<dyn SinkNode + Send + Sync>;
+            )) as Box<dyn SinkNode + Send>;
             Ok(sink)
         }) as _,
         #[cfg(not(any(
@@ -124,11 +124,14 @@ fn default_by_key_file_path_cb(
     _part_idx: usize,
     in_part_idx: usize,
     columns: Option<&[Column]>,
-) -> PolarsResult<PathBuf> {
+    separator: char,
+) -> PolarsResult<String> {
+    use std::fmt::Write;
+
     let columns = columns.unwrap();
     assert!(!columns.is_empty());
 
-    let mut file_path = PathBuf::new();
+    let mut file_path = String::new();
     for c in columns {
         let name = c.name();
         let value = c.head(Some(1)).strict_cast(&DataType::String)?;
@@ -138,18 +141,20 @@ fn default_by_key_file_path_cb(
             .unwrap_or("__HIVE_DEFAULT_PARTITION__")
             .as_bytes();
         let value = percent_encoding::percent_encode(value, polars_io::utils::URL_ENCODE_CHAR_SET);
-        file_path = file_path.join(format!("{name}={value}"));
+        write!(&mut file_path, "{name}={value}").unwrap();
+        file_path.push(separator);
     }
-    file_path = file_path.join(format!("{in_part_idx}.{ext}"));
+    write!(&mut file_path, "{in_part_idx}.{ext}").unwrap();
 
     Ok(file_path)
 }
 
-type FilePathCallback = fn(&str, usize, usize, usize, Option<&[Column]>) -> PolarsResult<PathBuf>;
+type FilePathCallback =
+    fn(&str, usize, usize, usize, Option<&[Column]>, char) -> PolarsResult<String>;
 
 #[allow(clippy::too_many_arguments)]
 async fn open_new_sink(
-    base_path: &Path,
+    base_path: PlPathRef<'_>,
     file_path_cb: Option<&PartitionTargetCallback>,
     default_file_path_cb: FilePathCallback,
     file_idx: usize,
@@ -167,11 +172,12 @@ async fn open_new_sink(
     Option<(
         FuturesUnordered<AbortOnDropHandle<PolarsResult<()>>>,
         SinkSender,
-        Box<dyn SinkNode + Send + Sync>,
+        Box<dyn SinkNode + Send>,
     )>,
 > {
-    let file_path = default_file_path_cb(ext, file_idx, part_idx, in_part_idx, keys)?;
-    let path = base_path.join(file_path.as_path());
+    let separator = '/'; // note: accepted by both Windows and Linux
+    let file_path = default_file_path_cb(ext, file_idx, part_idx, in_part_idx, keys, separator)?;
+    let path = base_path.join(file_path.as_str());
 
     // If the user provided their own callback, modify the path to that.
     let target = if let Some(file_path_cb) = file_path_cb {
@@ -192,13 +198,13 @@ async fn open_new_sink(
             file_path,
             full_path: path,
         })?;
-        // Offset the given path by the base_path.
         match target {
-            SinkTarget::Path(p) => SinkTarget::Path(Arc::new(base_path.join(p.as_path()))),
-            target => target,
+            // Offset the given path by the base_path.
+            PartitionTargetCallbackResult::Str(p) => SinkTarget::Path(base_path.join(p)),
+            PartitionTargetCallbackResult::Dyn(t) => SinkTarget::Dyn(t),
         }
     } else {
-        SinkTarget::Path(Arc::new(path))
+        SinkTarget::Path(path)
     };
 
     if verbose {
@@ -293,6 +299,7 @@ async fn open_new_sink(
     }
 
     let (mut sink_input_tx, sink_input_rx) = connector::connector();
+    node.initialize(state)?;
     node.spawn_sink(sink_input_rx, state, &mut join_handles);
     let mut join_handles =
         FuturesUnordered::from_iter(join_handles.into_iter().map(AbortOnDropHandle::new));

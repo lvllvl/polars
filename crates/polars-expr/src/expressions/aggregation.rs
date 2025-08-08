@@ -166,7 +166,7 @@ impl PhysicalExpr for AggregationExpr {
         let keep_name = ac.get_values().name().clone();
 
         // Literals cannot be aggregated except for implode.
-        polars_ensure!(!matches!(ac.agg_state(), AggState::Literal(_)), ComputeError: "cannot aggregate a literal");
+        polars_ensure!(!matches!(ac.agg_state(), AggState::LiteralScalar(_)), ComputeError: "cannot aggregate a literal");
 
         if let AggregatedScalar(_) = ac.agg_state() {
             match self.agg_type.groupby {
@@ -267,7 +267,7 @@ impl PhysicalExpr for AggregationExpr {
                     } else {
                         // TODO: optimize this/and write somewhere else.
                         match ac.agg_state() {
-                            AggState::Literal(s) | AggState::AggregatedScalar(s) => {
+                            AggState::LiteralScalar(s) | AggState::AggregatedScalar(s) => {
                                 AggregatedScalar(Column::new(
                                     keep_name,
                                     [(s.len() as IdxSize - s.null_count() as IdxSize)],
@@ -768,17 +768,11 @@ where
     #[cfg(not(debug_assertions))]
     let thread_boundary = 100_000;
 
-    // Temporary until categorical min/max multithreading implementation is corrected.
-    #[cfg(feature = "dtype-categorical")]
-    let is_categorical = matches!(s.dtype(), &DataType::Categorical(_, _));
-    #[cfg(not(feature = "dtype-categorical"))]
-    let is_categorical = false;
     // threading overhead/ splitting work stealing is costly..
 
     if !allow_threading
         || s.len() < thread_boundary
         || POOL.current_thread_has_pending_tasks().unwrap_or(false)
-        || is_categorical
     {
         return f(s);
     }

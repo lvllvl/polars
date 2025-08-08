@@ -1,5 +1,4 @@
 use polars_core::prelude::*;
-use polars_plan::constants::MAP_LIST_NAME;
 use polars_plan::prelude::expr_ir::ExprIR;
 use polars_plan::prelude::*;
 use recursive::recursive;
@@ -286,10 +285,7 @@ fn create_physical_expr_inner(
             )))
         },
         BinaryExpr { left, op, right } => {
-            let output_field =
-                expr_arena
-                    .get(expression)
-                    .to_field(schema, Context::Default, expr_arena)?;
+            let output_field = expr_arena.get(expression).to_field(schema, expr_arena)?;
             let is_scalar = is_scalar_ae(expression, expr_arena);
             let lhs = create_physical_expr_inner(*left, ctxt, expr_arena, schema, state)?;
             let rhs = create_physical_expr_inner(*right, ctxt, expr_arena, schema, state)?;
@@ -408,7 +404,7 @@ fn create_physical_expr_inner(
                         return Ok(Arc::new(AggQuantileExpr::new(input, quantile, *interpol)));
                     }
 
-                    let field = expr_arena.get(expression).to_field(
+                    let field = expr_arena.get(expression).to_field_with_ctx(
                         schema,
                         Context::Aggregation,
                         expr_arena,
@@ -434,7 +430,6 @@ fn create_physical_expr_inner(
                 dtype: dtype.clone(),
                 expr: node_to_expr(expression, expr_arena),
                 options: *options,
-                inlined_eval: Default::default(),
             }))
         },
         Ternary {
@@ -473,7 +468,7 @@ fn create_physical_expr_inner(
             let is_scalar = is_scalar_ae(expression, expr_arena);
             let output_field = expr_arena
                 .get(expression)
-                .to_field(schema, ctxt, expr_arena)?;
+                .to_field_with_ctx(schema, ctxt, expr_arena)?;
 
             let input =
                 create_physical_expressions_from_irs(input, ctxt, expr_arena, schema, state)?;
@@ -494,19 +489,18 @@ fn create_physical_expr_inner(
             evaluation,
             variant,
         } => {
-            let is_user_apply = expr_arena.iter(*expr).any(|(_, e)| matches!(e, AExpr::AnonymousFunction { fmt_str, .. } if fmt_str.as_ref().as_str() == MAP_LIST_NAME));
             let is_scalar = is_scalar_ae(expression, expr_arena);
             let evaluation_is_scalar = is_scalar_ae(*evaluation, expr_arena);
             let mut pd_group = ExprPushdownGroup::Pushable;
             pd_group.update_with_expr_rec(expr_arena.get(*evaluation), expr_arena, None);
             let output_field = expr_arena
                 .get(expression)
-                .to_field(schema, ctxt, expr_arena)?;
+                .to_field_with_ctx(schema, ctxt, expr_arena)?;
             let non_aggregated_output_field =
-                expr_arena
-                    .get(expression)
-                    .to_field(schema, Context::Default, expr_arena)?;
-            let input_field = expr_arena.get(*expr).to_field(schema, ctxt, expr_arena)?;
+                expr_arena.get(expression).to_field(schema, expr_arena)?;
+            let input_field = expr_arena
+                .get(*expr)
+                .to_field_with_ctx(schema, ctxt, expr_arena)?;
             let expr = create_physical_expr_inner(*expr, ctxt, expr_arena, schema, state)?;
 
             let element_dtype = variant.element_dtype(&input_field.dtype)?;
@@ -530,7 +524,6 @@ fn create_physical_expr_inner(
                 is_scalar,
                 pd_group,
                 evaluation_is_scalar,
-                is_user_apply,
             )))
         },
         Function {
@@ -541,7 +534,7 @@ fn create_physical_expr_inner(
             let is_scalar = is_scalar_ae(expression, expr_arena);
             let output_field = expr_arena
                 .get(expression)
-                .to_field(schema, ctxt, expr_arena)?;
+                .to_field_with_ctx(schema, ctxt, expr_arena)?;
             let input =
                 create_physical_expressions_from_irs(input, ctxt, expr_arena, schema, state)?;
 
@@ -564,7 +557,8 @@ fn create_physical_expr_inner(
             let input = create_physical_expr_inner(*input, ctxt, expr_arena, schema, state)?;
             let offset = create_physical_expr_inner(*offset, ctxt, expr_arena, schema, state)?;
             let length = create_physical_expr_inner(*length, ctxt, expr_arena, schema, state)?;
-            polars_ensure!(!(state.has_implode() && matches!(ctxt, Context::Aggregation)), InvalidOperation: "'implode' followed by a slice during aggregation is not allowed");
+            polars_ensure!(!(state.has_implode() && matches!(ctxt, Context::Aggregation)),
+                InvalidOperation: "'implode' followed by a slice during aggregation is not allowed");
             Ok(Arc::new(SliceExpr {
                 input,
                 offset,
@@ -583,7 +577,7 @@ fn create_physical_expr_inner(
 
             let field = expr_arena
                 .get(expression)
-                .to_field(schema, ctxt, expr_arena)?;
+                .to_field_with_ctx(schema, ctxt, expr_arena)?;
 
             Ok(Arc::new(ApplyExpr::new(
                 vec![input],

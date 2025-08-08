@@ -76,10 +76,10 @@ pub trait ChunkAnyValue {
     ///
     /// # Safety
     /// Does not do any bounds checking.
-    unsafe fn get_any_value_unchecked(&self, index: usize) -> AnyValue;
+    unsafe fn get_any_value_unchecked(&self, index: usize) -> AnyValue<'_>;
 
     /// Get a single value. Beware this is slow.
-    fn get_any_value(&self, index: usize) -> PolarsResult<AnyValue>;
+    fn get_any_value(&self, index: usize) -> PolarsResult<AnyValue<'_>>;
 }
 
 /// Explode/flatten a List or String Series
@@ -102,14 +102,11 @@ pub trait ChunkBytes {
 pub trait ChunkRollApply: AsRefDataType {
     fn rolling_map(
         &self,
-        _f: &dyn Fn(&Series) -> Series,
-        _options: RollingOptionsFixedWindow,
+        f: &dyn Fn(&Series) -> PolarsResult<Series>,
+        options: RollingOptionsFixedWindow,
     ) -> PolarsResult<Series>
     where
-        Self: Sized,
-    {
-        polars_bail!(opq = rolling_map, self.as_ref_dtype());
-    }
+        Self: Sized;
 }
 
 pub trait ChunkTake<Idx: ?Sized>: ChunkTakeUnchecked<Idx> {

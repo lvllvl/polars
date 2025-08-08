@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use futures::StreamExt;
@@ -12,10 +12,12 @@ use polars_core::utils::arrow::buffer::Buffer;
 use polars_error::PolarsResult;
 use polars_plan::dsl::{PartitionTargetCallback, SinkFinishCallback, SinkOptions};
 use polars_utils::pl_str::PlSmallStr;
+use polars_utils::plpath::PlPath;
 use polars_utils::priority::Priority;
 
 use super::{CreateNewSinkFn, PerPartitionSortBy};
 use crate::async_executor::{AbortOnDropHandle, spawn};
+use crate::async_primitives::connector::connector;
 use crate::execute::StreamingExecutionState;
 use crate::morsel::SourceToken;
 use crate::nodes::io_sinks::metrics::WriteMetrics;
@@ -37,7 +39,7 @@ pub struct PartitionByKeySinkNode {
     max_open_partitions: usize,
     include_key: bool,
 
-    base_path: Arc<PathBuf>,
+    base_path: Arc<PlPath>,
     file_path_cb: Option<PartitionTargetCallback>,
     create_new: CreateNewSinkFn,
     ext: PlSmallStr,
@@ -54,7 +56,7 @@ impl PartitionByKeySinkNode {
     pub fn new(
         input_schema: SchemaRef,
         key_cols: Arc<[PlSmallStr]>,
-        base_path: Arc<PathBuf>,
+        base_path: Arc<PlPath>,
         file_path_cb: Option<PartitionTargetCallback>,
         create_new: CreateNewSinkFn,
         ext: PlSmallStr,
@@ -118,11 +120,7 @@ impl SinkNode for PartitionByKeySinkNode {
         self.sink_options.maintain_order
     }
 
-    fn finish(&self) -> PolarsResult<()> {
-        if let Some(finish_callback) = &self.finish_callback {
-            let df = self.written_partitions.get().unwrap();
-            finish_callback.call(df.clone())?;
-        }
+    fn initialize(&mut self, _state: &StreamingExecutionState) -> PolarsResult<()> {
         Ok(())
     }
 
@@ -132,11 +130,13 @@ impl SinkNode for PartitionByKeySinkNode {
         state: &StreamingExecutionState,
         join_handles: &mut Vec<JoinHandle<polars_error::PolarsResult<()>>>,
     ) {
-        let (pass_rxs, mut io_rx) = parallelize_receive_task::<Linearized>(
+        let (io_tx, mut io_rx) = connector();
+        let pass_rxs = parallelize_receive_task::<Linearized>(
             join_handles,
             recv_port_rx,
             state.num_pipelines,
             self.sink_options.maintain_order,
+            io_tx,
         );
 
         join_handles.extend(pass_rxs.into_iter().map(|mut pass_rx| {
@@ -217,7 +217,7 @@ impl SinkNode for PartitionByKeySinkNode {
                 Sink {
                     sender: SinkSender,
                     join_handles: FuturesUnordered<AbortOnDropHandle<PolarsResult<()>>>,
-                    node: Box<dyn SinkNode + Send + Sync>,
+                    node: Box<dyn SinkNode + Send>,
                     keys: Vec<Column>,
                 },
                 Buffer {
@@ -256,7 +256,7 @@ impl SinkNode for PartitionByKeySinkNode {
                                 },
                                 None => {
                                     let result = open_new_sink(
-                                        base_path.as_path(),
+                                        base_path.as_ref().as_ref(),
                                         file_path_cb.as_ref(),
                                         super::default_by_key_file_path_cb,
                                         file_idx,
@@ -309,11 +309,11 @@ impl SinkNode for PartitionByKeySinkNode {
             // At this point, we need to wait for all sinks to finish writing and close them. Also,
             // sinks that ended up buffering need to output their data.
             for open_partition in open_partitions.into_values() {
-                let (sender, mut join_handles, node, keys) = match open_partition {
+                let (sender, mut join_handles, mut node, keys) = match open_partition {
                     OpenPartition::Sink { sender, join_handles, node, keys } => (sender, join_handles, node, keys),
                     OpenPartition::Buffer { buffered, keys } => {
                         let result = open_new_sink(
-                            base_path.as_path(),
+                            base_path.as_ref().as_ref(),
                             file_path_cb.as_ref(),
                             super::default_by_key_file_path_cb,
                             file_idx,
@@ -356,12 +356,30 @@ impl SinkNode for PartitionByKeySinkNode {
                     metrics.keys = Some(keys.into_iter().map(|c| c.get(0).unwrap().into_static()).collect());
                     partition_metrics.push(metrics);
                 }
-                node.finish()?;
+                if let Some(finalize) = node.finalize(&state) {
+                    finalize.await?;
+                }
             }
 
             let df = WriteMetrics::collapse_to_df(partition_metrics, &sink_input_schema, Some(&input_schema.try_project(key_cols.iter()).unwrap()));
             output_written_partitions.set(df).unwrap();
             Ok(())
         }));
+    }
+
+    fn finalize(
+        &mut self,
+        _state: &StreamingExecutionState,
+    ) -> Option<Pin<Box<dyn Future<Output = PolarsResult<()>> + Send>>> {
+        let finish_callback = self.finish_callback.clone();
+        let written_partitions = self.written_partitions.clone();
+
+        Some(Box::pin(async move {
+            if let Some(finish_callback) = &finish_callback {
+                let df = written_partitions.get().unwrap();
+                finish_callback.call(df.clone())?;
+            }
+            Ok(())
+        }))
     }
 }

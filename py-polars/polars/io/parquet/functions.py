@@ -30,15 +30,21 @@ from polars.io.cloud.credential_provider._builder import (
 from polars.io.scan_options._options import ScanOptions
 
 with contextlib.suppress(ImportError):
-    from polars.polars import PyLazyFrame
-    from polars.polars import read_parquet_metadata as _read_parquet_metadata
-    from polars.polars import read_parquet_schema as _read_parquet_schema
+    from polars._plr import PyLazyFrame
+    from polars._plr import read_parquet_metadata as _read_parquet_metadata
 
 if TYPE_CHECKING:
     from typing import Literal
 
     from polars import DataFrame, DataType, LazyFrame
-    from polars._typing import DeletionFiles, FileSource, ParallelStrategy, SchemaDict
+    from polars._typing import (
+        ColumnMapping,
+        DefaultFieldValues,
+        DeletionFiles,
+        FileSource,
+        ParallelStrategy,
+        SchemaDict,
+    )
     from polars.io.cloud import CredentialProviderFunction
     from polars.io.scan_options import ScanCastOptions
 
@@ -341,6 +347,10 @@ def read_parquet_schema(source: str | Path | IO[bytes] | bytes) -> dict[str, Dat
     """
     Get the schema of a Parquet file without reading data.
 
+    If you would like to read the schema of a cloud file with authentication
+    configuration, it is recommended use `scan_parquet` - e.g.
+    `scan_parquet(..., storage_options=...).collect_schema()`.
+
     Parameters
     ----------
     source
@@ -353,11 +363,12 @@ def read_parquet_schema(source: str | Path | IO[bytes] | bytes) -> dict[str, Dat
     -------
     dict
         Dictionary mapping column names to datatypes
-    """
-    if isinstance(source, (str, Path)):
-        source = normalize_filepath(source, check_not_directory=False)
 
-    return _read_parquet_schema(source)
+    See Also
+    --------
+    scan_parquet
+    """
+    return scan_parquet(source).collect_schema()
 
 
 def read_parquet_metadata(source: str | Path | IO[bytes] | bytes) -> dict[str, str]:
@@ -413,6 +424,8 @@ def scan_parquet(
     allow_missing_columns: bool | None = None,
     extra_columns: Literal["ignore", "raise"] = "raise",
     cast_options: ScanCastOptions | None = None,
+    _column_mapping: ColumnMapping | None = None,
+    _default_values: DefaultFieldValues | None = None,
     _deletion_files: DeletionFiles | None = None,
 ) -> LazyFrame:
     """
@@ -641,6 +654,8 @@ def scan_parquet(
             ),
             credential_provider=credential_provider_builder,
             retries=retries,
+            column_mapping=_column_mapping,
+            default_values=_default_values,
             deletion_files=_deletion_files,
         ),
     )

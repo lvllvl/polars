@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 import polars as pl
-from polars._utils.udfs import _NUMPY_FUNCTIONS, BytecodeParser
+from polars._utils.udfs import _BYTECODE_PARSER_CACHE_, _NUMPY_FUNCTIONS, BytecodeParser
 from polars._utils.various import in_terminal_that_supports_colour
 from polars.exceptions import PolarsInefficientMapWarning
 from polars.testing import assert_frame_equal, assert_series_equal
@@ -298,9 +298,11 @@ def test_parse_invalid_function(func: str) -> None:
     TEST_CASES,
 )
 @pytest.mark.filterwarnings(
+    "ignore:.*:polars.exceptions.MapWithoutReturnDtypeWarning",
     "ignore:invalid value encountered:RuntimeWarning",
     "ignore:.*without specifying `return_dtype`:polars.exceptions.MapWithoutReturnDtypeWarning",
 )
+@pytest.mark.may_fail_auto_streaming  # dtype not set
 def test_parse_apply_functions(col: str, func: str, expr_repr: str) -> None:
     with pytest.warns(
         PolarsInefficientMapWarning,
@@ -341,9 +343,11 @@ def test_parse_apply_functions(col: str, func: str, expr_repr: str) -> None:
 
 
 @pytest.mark.filterwarnings(
+    "ignore:.*:polars.exceptions.MapWithoutReturnDtypeWarning",
     "ignore:invalid value encountered:RuntimeWarning",
     "ignore:.*without specifying `return_dtype`:polars.exceptions.MapWithoutReturnDtypeWarning",
 )
+@pytest.mark.may_fail_auto_streaming  # dtype is not set
 def test_parse_apply_raw_functions() -> None:
     lf = pl.LazyFrame({"a": [1.1, 2.0, 3.4]})
 
@@ -360,7 +364,9 @@ def test_parse_apply_raw_functions() -> None:
             PolarsInefficientMapWarning,
             match=rf"(?s)Expr\.map_elements.*Replace this expression.*np\.{func_name}",
         ):
-            df1 = lf.select(pl.col("a").map_elements(func)).collect()
+            df1 = lf.select(
+                pl.col("a").map_elements(func, return_dtype=pl.self_dtype())
+            ).collect()
             df2 = lf.select(getattr(pl.col("a"), func_name)()).collect()
             assert_frame_equal(df1, df2)
 
@@ -372,7 +378,16 @@ def test_parse_apply_raw_functions() -> None:
     ):
         for expr in (
             pl.col("value").str.json_decode(),
-            pl.col("value").map_elements(json.loads),
+            pl.col("value").map_elements(
+                json.loads,
+                return_dtype=pl.Struct(
+                    {
+                        "a": pl.Int64,
+                        "b": pl.Boolean,
+                        "c": pl.String,
+                    }
+                ),
+            ),
         ):
             result_frames.append(  # noqa: PERF401
                 pl.LazyFrame({"value": ['{"a":1, "b": true, "c": "xx"}', None]})
@@ -390,7 +405,9 @@ def test_parse_apply_raw_functions() -> None:
             match=rf'(?s)with this one instead.*pl\.col\("a"\)\.cast\(pl\.{pl_dtype.__name__}\)',
         ):
             assert_frame_equal(
-                lf.select(pl.col("a").map_elements(py_cast)).collect(),
+                lf.select(
+                    pl.col("a").map_elements(py_cast, return_dtype=pl_dtype)
+                ).collect(),
                 lf.select(pl.col("a").cast(pl_dtype)).collect(),
             )
 
@@ -485,6 +502,7 @@ def test_parse_apply_series(
         assert_series_equal(expected_series, result_series)
 
 
+@pytest.mark.may_fail_auto_streaming
 def test_expr_exact_warning_message() -> None:
     red, green, end_escape = (
         ("\x1b[31m", "\x1b[32m", "\x1b[0m")
@@ -500,13 +518,22 @@ def test_expr_exact_warning_message() -> None:
         "with this one instead:\n"
         f'  {green}+ pl.col("a") + 1{end_escape}\n'
     )
-    # Check the EXACT warning message. If modifying the message in the future,
-    # make sure to keep the `^` and `$`, and keep the assertion on `len(warnings)`.
+
+    fn = lambda x: x + 1  # noqa: E731
+
+    # check the EXACT warning messages - if modifying the message in the future,
+    # make sure to keep the `^` and `$`, and the assertion on `len(warnings)`
     with pytest.warns(PolarsInefficientMapWarning, match=rf"^{msg}$") as warnings:
         df = pl.DataFrame({"a": [1, 2, 3]})
-        df.select(pl.col("a").map_elements(lambda x: x + 1, return_dtype=pl.Int64))
+        for _ in range(3):  # << loop a few times to exercise the caching path
+            df.select(pl.col("a").map_elements(fn, return_dtype=pl.Int64))
 
-    assert len(warnings) == 1
+    assert len(warnings) == 3
+
+    # confirm that the associated parser/etc was cached
+    bp = _BYTECODE_PARSER_CACHE_[(fn, "expr")]
+    assert isinstance(bp, BytecodeParser)
+    assert bp.to_expression("a") == 'pl.col("a") + 1'
 
 
 def test_omit_implicit_bool() -> None:

@@ -56,19 +56,19 @@ from polars.exceptions import DataOrientationWarning, ShapeError
 from polars.meta import thread_pool_size
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
-    from polars.polars import PyDataFrame
+    from polars._plr import PyDataFrame
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, MutableMapping
 
     from polars import DataFrame, Series
+    from polars._plr import PySeries
     from polars._typing import (
         Orientation,
         PolarsDataType,
         SchemaDefinition,
         SchemaDict,
     )
-    from polars.polars import PySeries
 
 _MIN_NUMPY_SIZE_FOR_MULTITHREADING = 1000
 
@@ -1213,9 +1213,6 @@ def numpy_to_pydf(
         n_columns = len(record_names)
         for nm in record_names:
             shape = data[nm].shape
-            if len(data[nm].shape) > 2:
-                msg = f"cannot create DataFrame from structured array with elements > 2D; shape[{nm!r}] = {shape}"
-                raise ValueError(msg)
         if not schema:
             schema = record_names
     else:

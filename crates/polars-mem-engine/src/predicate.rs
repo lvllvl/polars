@@ -10,7 +10,7 @@ use polars_error::PolarsResult;
 use polars_expr::prelude::{AggregationContext, PhysicalExpr, phys_expr_to_io_expr};
 use polars_expr::state::ExecutionState;
 use polars_io::predicates::{
-    ColumnPredicates, ScanIOPredicate, SkipBatchPredicate, SpecializedColumnPredicateExpr,
+    ColumnPredicates, ScanIOPredicate, SkipBatchPredicate, SpecializedColumnPredicate,
 };
 use polars_utils::pl_str::PlSmallStr;
 use polars_utils::{IdxSize, format_pl_smallstr};
@@ -47,13 +47,8 @@ impl fmt::Debug for ScanPredicate {
 
 #[derive(Clone)]
 pub struct PhysicalColumnPredicates {
-    pub predicates: PlHashMap<
-        PlSmallStr,
-        (
-            Arc<dyn PhysicalExpr>,
-            Option<SpecializedColumnPredicateExpr>,
-        ),
-    >,
+    pub predicates:
+        PlHashMap<PlSmallStr, (Arc<dyn PhysicalExpr>, Option<SpecializedColumnPredicate>)>,
     pub is_sumwise_complete: bool,
 }
 
@@ -222,10 +217,19 @@ impl SkipBatchPredicate for SkipBatchPredicateHelper {
         let array = array.bool()?;
         let array = array.downcast_as_array();
 
-        if let Some(validity) = array.validity() {
-            Ok(array.values() & validity)
+        let array = if let Some(validity) = array.validity() {
+            array.values() & validity
         } else {
-            Ok(array.values().clone())
+            array.values().clone()
+        };
+
+        // @NOTE: Certain predicates like `1 == 1` will only output 1 value. We need to broadcast
+        // the result back to the dataframe length.
+        if array.len() == 1 && df.height() != 0 {
+            return Ok(Bitmap::new_with_value(array.get_bit(0), df.height()));
         }
+
+        assert_eq!(array.len(), df.height());
+        Ok(array)
     }
 }

@@ -10,13 +10,13 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
 
     from polars import Expr, Series
+    from polars._plr import PySeries
     from polars._typing import (
         IntoExpr,
         IntoExprColumn,
         ListToStructWidthStrategy,
         NullBehavior,
     )
-    from polars.polars import PySeries
 
 
 @expr_dispatch
@@ -168,7 +168,7 @@ class ListNameSpace:
         shape: (2,)
         Series: 'values' [list[i64]]
         [
-            [2, 1]
+            [2, 3]
             [5]
         ]
         """

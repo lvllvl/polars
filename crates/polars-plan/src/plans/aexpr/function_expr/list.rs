@@ -60,7 +60,7 @@ pub enum IRListFunction {
     #[cfg(feature = "dtype-array")]
     ToArray(usize),
     #[cfg(feature = "list_to_struct")]
-    ToStruct(ListToStructArgs),
+    ToStruct(ListToStruct),
 }
 
 impl IRListFunction {
@@ -88,8 +88,8 @@ impl IRListFunction {
             Max => mapper.map_to_list_and_array_inner_dtype(),
             Mean => mapper.nested_mean_median_type(),
             Median => mapper.nested_mean_median_type(),
-            Std(_) => mapper.map_to_float_dtype(), // Need to also have this sometimes marked as float32 or duration..
-            Var(_) => mapper.map_to_float_dtype(),
+            Std(_) => mapper.moment_dtype(), // Need to also have this sometimes marked as float32 or duration..
+            Var(_) => mapper.var_dtype(),
             ArgMin => mapper.with_dtype(IDX_DTYPE),
             ArgMax => mapper.with_dtype(IDX_DTYPE),
             #[cfg(feature = "diff")]
@@ -128,7 +128,39 @@ impl IRListFunction {
             ToArray(width) => mapper.try_map_dtype(|dt| map_list_dtype_to_array_dtype(dt, *width)),
             NUnique => mapper.with_dtype(IDX_DTYPE),
             #[cfg(feature = "list_to_struct")]
-            ToStruct(args) => mapper.try_map_dtype(|x| args.get_output_dtype(x)),
+            ToStruct(args) => mapper.try_map_dtype(|dtype| {
+                let DataType::List(inner_dtype) = dtype else {
+                    polars_bail!(
+                        InvalidOperation:
+                        "attempted list to_struct on non-list dtype: {dtype}",
+                    );
+                };
+                let inner_dtype = inner_dtype.as_ref();
+
+                match args {
+                    ListToStruct::FixedWidth(names) => Ok(DataType::Struct(
+                        names
+                            .iter()
+                            .map(|x| Field::new(x.clone(), inner_dtype.clone()))
+                            .collect::<Vec<_>>(),
+                    )),
+                    ListToStruct::InferWidth {
+                        get_index_name,
+                        max_fields: Some(max_fields),
+                        ..
+                    } => (0..*max_fields)
+                        .map(|i| {
+                            let name = match get_index_name {
+                                None => _default_struct_name_gen(i),
+                                Some(ng) => PlSmallStr::from_string(ng.call(i)?),
+                            };
+                            Ok(Field::new(name, inner_dtype.as_ref().clone()))
+                        })
+                        .collect::<PolarsResult<Vec<_>>>()
+                        .map(DataType::Struct),
+                    ListToStruct::InferWidth { .. } => Ok(DataType::Unknown(UnknownKind::Any)),
+                }
+            }),
         }
     }
 
@@ -180,9 +212,9 @@ impl IRListFunction {
             #[cfg(feature = "dtype-array")]
             L::ToArray(_) => FunctionOptions::elementwise(),
             #[cfg(feature = "list_to_struct")]
-            L::ToStruct(ListToStructArgs::FixedWidth(_)) => FunctionOptions::elementwise(),
+            L::ToStruct(ListToStruct::FixedWidth(_)) => FunctionOptions::elementwise(),
             #[cfg(feature = "list_to_struct")]
-            L::ToStruct(ListToStructArgs::InferWidth { .. }) => FunctionOptions::groupwise(),
+            L::ToStruct(ListToStruct::InferWidth { .. }) => FunctionOptions::length_preserving(),
         }
     }
 }
@@ -504,125 +536,7 @@ pub(super) fn get(s: &mut [Column], null_on_oob: bool) -> PolarsResult<Option<Co
     let index = s[1].cast(&DataType::Int64)?;
     let index = index.i64().unwrap();
 
-    match index.len() {
-        1 => {
-            let index = index.get(0);
-            if let Some(index) = index {
-                ca.lst_get(index, null_on_oob).map(Column::from).map(Some)
-            } else {
-                Ok(Some(Column::full_null(
-                    ca.name().clone(),
-                    ca.len(),
-                    ca.inner_dtype(),
-                )))
-            }
-        },
-        len if len == ca.len() => {
-            let tmp = ca.rechunk();
-            let arr = tmp.downcast_as_array();
-            let offsets = arr.offsets().as_slice();
-            let take_by = if ca.null_count() == 0 {
-                index
-                    .iter()
-                    .enumerate()
-                    .map(|(i, opt_idx)| match opt_idx {
-                        Some(idx) => {
-                            let (start, end) = unsafe {
-                                (*offsets.get_unchecked(i), *offsets.get_unchecked(i + 1))
-                            };
-                            let offset = if idx >= 0 { start + idx } else { end + idx };
-                            if offset >= end || offset < start || start == end {
-                                if null_on_oob {
-                                    Ok(None)
-                                } else {
-                                    polars_bail!(ComputeError: "get index is out of bounds");
-                                }
-                            } else {
-                                Ok(Some(offset as IdxSize))
-                            }
-                        },
-                        None => Ok(None),
-                    })
-                    .collect::<Result<IdxCa, _>>()?
-            } else {
-                index
-                    .iter()
-                    .zip(arr.validity().unwrap())
-                    .enumerate()
-                    .map(|(i, (opt_idx, valid))| match (valid, opt_idx) {
-                        (true, Some(idx)) => {
-                            let (start, end) = unsafe {
-                                (*offsets.get_unchecked(i), *offsets.get_unchecked(i + 1))
-                            };
-                            let offset = if idx >= 0 { start + idx } else { end + idx };
-                            if offset >= end || offset < start || start == end {
-                                if null_on_oob {
-                                    Ok(None)
-                                } else {
-                                    polars_bail!(ComputeError: "get index is out of bounds");
-                                }
-                            } else {
-                                Ok(Some(offset as IdxSize))
-                            }
-                        },
-                        _ => Ok(None),
-                    })
-                    .collect::<Result<IdxCa, _>>()?
-            };
-            let s = Series::try_from((ca.name().clone(), arr.values().clone())).unwrap();
-            unsafe { s.take_unchecked(&take_by) }
-                .cast(ca.inner_dtype())
-                .map(Column::from)
-                .map(Some)
-        },
-        _ if ca.len() == 1 => {
-            if ca.null_count() > 0 {
-                return Ok(Some(Column::full_null(
-                    ca.name().clone(),
-                    index.len(),
-                    ca.inner_dtype(),
-                )));
-            }
-            let tmp = ca.rechunk();
-            let arr = tmp.downcast_as_array();
-            let offsets = arr.offsets().as_slice();
-            let start = offsets[0];
-            let end = offsets[1];
-            let out_of_bounds = |offset| offset >= end || offset < start || start == end;
-            let take_by: IdxCa = index
-                .iter()
-                .map(|opt_idx| match opt_idx {
-                    Some(idx) => {
-                        let offset = if idx >= 0 { start + idx } else { end + idx };
-                        if out_of_bounds(offset) {
-                            if null_on_oob {
-                                Ok(None)
-                            } else {
-                                polars_bail!(ComputeError: "get index is out of bounds");
-                            }
-                        } else {
-                            let Ok(offset) = IdxSize::try_from(offset) else {
-                                polars_bail!(ComputeError: "get index is out of bounds");
-                            };
-                            Ok(Some(offset))
-                        }
-                    },
-                    None => Ok(None),
-                })
-                .collect::<Result<IdxCa, _>>()?;
-
-            let s = Series::try_from((ca.name().clone(), arr.values().clone())).unwrap();
-            unsafe { s.take_unchecked(&take_by) }
-                .cast(ca.inner_dtype())
-                .map(Column::from)
-                .map(Some)
-        },
-        len => polars_bail!(
-            ComputeError:
-            "`list.get` expression got an index array of length {} while the list has {} elements",
-            len, ca.len()
-        ),
-    }
+    lst_get(ca, index, null_on_oob)
 }
 
 #[cfg(feature = "list_gather")]
@@ -696,7 +610,7 @@ pub(super) fn std(s: &Column, ddof: u8) -> PolarsResult<Column> {
 }
 
 pub(super) fn var(s: &Column, ddof: u8) -> PolarsResult<Column> {
-    Ok(s.list()?.lst_var(ddof).into())
+    Ok(s.list()?.lst_var(ddof)?.into())
 }
 
 pub(super) fn arg_min(s: &Column) -> PolarsResult<Column> {
@@ -779,8 +693,27 @@ pub(super) fn to_array(s: &Column, width: usize) -> PolarsResult<Column> {
 }
 
 #[cfg(feature = "list_to_struct")]
-pub(super) fn to_struct(s: &Column, args: &ListToStructArgs) -> PolarsResult<Column> {
-    Ok(s.list()?.to_struct(args)?.into_series().into())
+pub(super) fn to_struct(s: &Column, args: &ListToStruct) -> PolarsResult<Column> {
+    let args = args.clone();
+    let args = match args {
+        ListToStruct::FixedWidth(strs) => ListToStructArgs::FixedWidth(strs),
+        ListToStruct::InferWidth {
+            infer_field_strategy,
+            get_index_name,
+            max_fields,
+        } => {
+            let get_index_name = get_index_name.map(|f| {
+                NameGenerator(Arc::new(move |i| f.call(i).map(PlSmallStr::from)) as Arc<_>)
+            });
+
+            ListToStructArgs::InferWidth {
+                infer_field_strategy,
+                get_index_name,
+                max_fields,
+            }
+        },
+    };
+    Ok(s.list()?.to_struct(&args)?.into_column())
 }
 
 pub(super) fn n_unique(s: &Column) -> PolarsResult<Column> {

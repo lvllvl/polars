@@ -408,7 +408,7 @@ def test_group_by_sorted_empty_dataframe_3680() -> None:
     )
     assert df.rows() == []
     assert df.shape == (0, 2)
-    assert df.schema == {"key": pl.Categorical(ordering="physical"), "val": pl.Float64}
+    assert df.schema == {"key": pl.Categorical(ordering="lexical"), "val": pl.Float64}
 
 
 def test_group_by_custom_agg_empty_list() -> None:
@@ -938,7 +938,6 @@ def test_group_by_multiple_null_cols_15623() -> None:
 
 
 @pytest.mark.release
-@pytest.mark.usefixtures("test_global_and_local")
 def test_categorical_vs_str_group_by() -> None:
     # this triggers the perfect hash table
     s = pl.Series("a", np.random.randint(0, 50, 100))
@@ -1146,13 +1145,21 @@ def test_absence_off_null_prop_8224() -> None:
     ]
 
 
-def test_grouped_slice_literals() -> None:
-    assert pl.DataFrame({"idx": [1, 2, 3]}).group_by(True).agg(
-        x=pl.lit([1, 2]).slice(
-            -1, 1
-        ),  # slices a list of 1 element, so remains the same element
-        x2=pl.lit(pl.Series([1, 2])).slice(-1, 1),
-    ).to_dict(as_series=False) == {"literal": [True], "x": [[1, 2]], "x2": [2]}
+@pytest.mark.parametrize("maintain_order", [False, True])
+def test_grouped_slice_literals(maintain_order: bool) -> None:
+    assert_frame_equal(
+        pl.DataFrame({"idx": [1, 2, 3]})
+        .group_by(True, maintain_order=maintain_order)
+        .agg(
+            x=pl.lit([1, 2]).slice(
+                -1, 1
+            ),  # slices a list of 1 element, so remains the same element
+            x2=pl.lit(pl.Series([1, 2])).slice(-1, 1),
+            x3=pl.lit(pl.Series([[1, 2]])).slice(-1, 1),
+        ),
+        pl.DataFrame({"literal": [True], "x": [[1, 2]], "x2": [[2]], "x3": [[[1, 2]]]}),
+        check_row_order=maintain_order,
+    )
 
 
 def test_positional_by_with_list_or_tuple_17540() -> None:
@@ -1342,4 +1349,108 @@ def test_group_by_implode_22870() -> None:
         out,
         pl.DataFrame({"x": ["a", "b"], "y": [[1], [2]]}),
         check_row_order=False,
+    )
+
+
+# Note: the underlying bug is not guaranteed to manifest itself as it depends
+# on the internal group order, i.e., for the bug to materialize, there must be
+# empty groups before the non-empty group
+def test_group_by_empty_groups_23338() -> None:
+    # We need one non-empty and many groups
+    df = pl.DataFrame(
+        {
+            "k": [10, 10, 20, 30, 40, 50, 60, 70, 80, 90],
+            "a": [1, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        }
+    )
+    out = df.group_by("k").agg(
+        pl.col("a").filter(pl.col("a") == 1).fill_nan(None).sum()
+    )
+    expected = df.group_by("k").agg(pl.col("a").filter(pl.col("a") == 1).sum())
+    assert_frame_equal(out.sort("k"), expected.sort("k"))
+
+
+def test_group_by_filter_all_22955() -> None:
+    df = pl.DataFrame(
+        {
+            "grp": [1, 2, 3, 4, 5],
+            "value": [10, 20, 30, 40, 50],
+        }
+    )
+
+    assert_frame_equal(
+        df.group_by("grp").agg(
+            pl.all().filter(pl.col("value") > 20),
+        ),
+        pl.DataFrame(
+            {
+                "grp": [1, 2, 3, 4, 5],
+                "value": [[], [], [30], [40], [50]],
+            }
+        ),
+        check_row_order=False,
+    )
+
+
+@pytest.mark.parametrize("maintain_order", [False, True])
+def test_group_by_series_lit_22103(maintain_order: bool) -> None:
+    df = pl.DataFrame(
+        {
+            "g": [0, 1],
+        }
+    )
+    assert_frame_equal(
+        df.group_by("g", maintain_order=maintain_order).agg(
+            foo=pl.lit(pl.Series([42, 2, 3]))
+        ),
+        pl.DataFrame(
+            {
+                "g": [0, 1],
+                "foo": [[42, 2, 3], [42, 2, 3]],
+            }
+        ),
+        check_row_order=maintain_order,
+    )
+
+
+@pytest.mark.parametrize("maintain_order", [False, True])
+def test_group_by_filter_sum_23897(maintain_order: bool) -> None:
+    testdf = pl.DataFrame(
+        {
+            "id": [8113, 9110, 9110],
+            "value": [None, None, 1.0],
+            "weight": [1.0, 1.0, 1.0],
+        }
+    )
+
+    w = pl.col("weight").filter(pl.col("value").is_finite())
+
+    w = w / w.sum()
+
+    result = w.sum()
+
+    assert_frame_equal(
+        testdf.group_by("id", maintain_order=maintain_order).agg(result),
+        pl.DataFrame({"id": [8113, 9110], "weight": [0.0, 1.0]}),
+        check_row_order=maintain_order,
+    )
+
+
+@pytest.mark.parametrize("maintain_order", [False, True])
+def test_group_by_shift_filter_23910(maintain_order: bool) -> None:
+    df = pl.DataFrame({"a": [3, 7, 5, 9, 2, 1], "b": [2, 2, 2, 3, 3, 1]})
+
+    out = df.group_by("b", maintain_order=maintain_order).agg(
+        pl.col("a").filter(pl.col("a") > pl.col("a").shift(1)).sum().alias("tt")
+    )
+
+    assert_frame_equal(
+        out,
+        pl.DataFrame(
+            {
+                "b": [2, 3, 1],
+                "tt": [7, 0, 0],
+            }
+        ),
+        check_row_order=maintain_order,
     )

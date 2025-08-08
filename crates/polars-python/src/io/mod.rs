@@ -1,13 +1,14 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
+use polars::prelude::default_values::DefaultFieldValues;
 use polars::prelude::deletion::DeletionFilesList;
 use polars::prelude::{
-    CastColumnsPolicy, ExtraColumnsPolicy, MissingColumnsPolicy, PlSmallStr, Schema,
+    CastColumnsPolicy, ColumnMapping, ExtraColumnsPolicy, MissingColumnsPolicy, PlSmallStr, Schema,
     UnifiedScanArgs,
 };
 use polars_io::{HiveOptions, RowIndex};
 use polars_utils::IdxSize;
+use polars_utils::plpath::PlPathRef;
 use polars_utils::slice_enum::Slice;
 use pyo3::types::PyAnyMethods;
 use pyo3::{Bound, FromPyObject, PyObject, PyResult};
@@ -27,7 +28,7 @@ impl PyScanOptions<'_> {
     pub fn extract_unified_scan_args(
         &self,
         // For cloud_options init
-        first_path: Option<&PathBuf>,
+        first_path: Option<PlPathRef>,
     ) -> PyResult<UnifiedScanArgs> {
         #[derive(FromPyObject)]
         struct Extract {
@@ -38,6 +39,8 @@ impl PyScanOptions<'_> {
             missing_columns: Wrap<MissingColumnsPolicy>,
             include_file_paths: Option<Wrap<PlSmallStr>>,
             glob: bool,
+            column_mapping: Option<Wrap<ColumnMapping>>,
+            default_values: Option<Wrap<DefaultFieldValues>>,
             hive_partitioning: Option<bool>,
             hive_schema: Option<Wrap<Schema>>,
             try_parse_hive_dates: bool,
@@ -56,6 +59,8 @@ impl PyScanOptions<'_> {
             extra_columns,
             missing_columns,
             include_file_paths,
+            column_mapping,
+            default_values,
             glob,
             hive_partitioning,
             hive_schema,
@@ -77,9 +82,9 @@ impl PyScanOptions<'_> {
 
                 use crate::prelude::parse_cloud_options;
 
-                let first_path_url = first_path.to_string_lossy();
+                let first_path_url = first_path.to_str();
                 let cloud_options =
-                    parse_cloud_options(&first_path_url, cloud_options.unwrap_or_default())?;
+                    parse_cloud_options(first_path_url, cloud_options.unwrap_or_default())?;
 
                 Some(
                     cloud_options
@@ -122,6 +127,10 @@ impl PyScanOptions<'_> {
             cache,
             glob,
             projection: None,
+            column_mapping: column_mapping.map(|x| x.0),
+            default_values: default_values
+                .map(|x| x.0)
+                .filter(|DefaultFieldValues::Iceberg(v)| !v.is_empty()),
             row_index,
             pre_slice: pre_slice.map(Slice::from),
             cast_columns_policy: cast_options.0,
