@@ -216,9 +216,12 @@ pub fn initialize_scan_predicate<'a>(
             break 'create_skip_files_mask;
         };
 
-        let expected_mask_len: usize;
+        let mut skip_files_mask: Option<SkipFilesMask> = None;
+        let mut send_predicate_to_readers = false;
+        let mut expected_mask_len: Option<usize> = None;
 
-        let (skip_files_mask, send_predicate_to_readers) = if let Some(hive_parts) = hive_parts
+        // Step 1: Try hive partition filtering.
+        if let Some(hive_parts) = hive_parts
             && let Some(hive_predicate) = &predicate.hive_predicate
         {
             if verbose {
@@ -227,7 +230,8 @@ pub fn initialize_scan_predicate<'a>(
                 );
             }
 
-            expected_mask_len = hive_parts.df().height();
+            let hive_len = hive_parts.df().height();
+            expected_mask_len = Some(hive_len);
 
             let inclusion_mask = hive_predicate
                 .evaluate_io(hive_parts.df())?
@@ -240,11 +244,12 @@ pub fn initialize_scan_predicate<'a>(
                 .values()
                 .clone();
 
-            (
-                SkipFilesMask::Inclusion(inclusion_mask),
-                !predicate.hive_predicate_is_full_predicate,
-            )
-        } else if let Some(table_statistics) = table_statistics
+            skip_files_mask = Some(SkipFilesMask::Inclusion(inclusion_mask));
+            send_predicate_to_readers = !predicate.hive_predicate_is_full_predicate;
+        }
+
+        // Step 2: Also try table statistics filtering.
+        if let Some(table_statistics) = table_statistics
             && let Some(skip_batch_predicate) = &predicate.skip_batch_predicate
         {
             if verbose {
@@ -253,14 +258,25 @@ pub fn initialize_scan_predicate<'a>(
                 );
             }
 
-            expected_mask_len = table_statistics.0.height();
-
+            let stats_len = table_statistics.0.height();
             let exclusion_mask = skip_batch_predicate.evaluate_with_stat_df(&table_statistics.0)?;
 
-            (SkipFilesMask::Exclusion(exclusion_mask), true)
-        } else {
+            skip_files_mask = Some(match skip_files_mask {
+                Some(SkipFilesMask::Inclusion(inclusion)) => {
+                    // Combine: include only if hive includes AND stats don't exclude.
+                    // combined_inclusion = hive_inclusion AND NOT stats_exclusion
+                    SkipFilesMask::Inclusion(&inclusion & &!&exclusion_mask)
+                },
+                _ => SkipFilesMask::Exclusion(exclusion_mask),
+            });
+            expected_mask_len = Some(stats_len);
+            send_predicate_to_readers = true;
+        }
+
+        let Some(skip_files_mask) = skip_files_mask else {
             break 'create_skip_files_mask;
         };
+        let expected_mask_len = expected_mask_len.unwrap();
 
         if skip_files_mask.len() != expected_mask_len {
             polars_warn!(

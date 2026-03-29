@@ -1157,6 +1157,46 @@ def test_scan_delta_filter_delta_log_statistics_delete_partition_23780(
     assert "skipping 1 / 2 files" in capfd.readouterr().err
 
 
+@pytest.mark.write_disk
+def test_scan_delta_combined_hive_and_stats_filtering_27072(
+    tmp_path: Path,
+    plmonkeypatch: PlMonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "delta"
+
+    # Create 4 files: 2 partitions × 2 files each, with non-overlapping "a" ranges.
+    pl.DataFrame({"a": [1, 2], "p": [10, 10]}).write_delta(
+        root, delta_write_options={"partition_by": "p"}
+    )
+    for chunk in [
+        pl.DataFrame({"a": [3, 4], "p": [10, 10]}),
+        pl.DataFrame({"a": [1, 2], "p": [20, 20]}),
+        pl.DataFrame({"a": [3, 4], "p": [20, 20]}),
+    ]:
+        chunk.write_delta(
+            root, mode="append", delta_write_options={"partition_by": "p"}
+        )
+
+    df = pl.DataFrame(
+        {"a": [1, 2, 3, 4, 1, 2, 3, 4], "p": [10, 10, 10, 10, 20, 20, 20, 20]}
+    )
+
+    plmonkeypatch.setenv("POLARS_VERBOSE", "1")
+    capfd.readouterr()
+
+    # Filter on both partition column (p) and stats-filterable column (a).
+    # Hive prunes 2 files (p=20), stats prune 1 more (a=[3,4] in p=10) = 3/4 skipped.
+    expr = (pl.col.p == 10) & (pl.col.a <= 2)
+    assert_frame_equal(
+        pl.scan_delta(root).filter(expr).collect(),
+        df.filter(expr),
+        check_column_order=False,
+        check_row_order=False,
+    )
+    assert "skipping 3 / 4 files" in capfd.readouterr().err
+
+
 @pytest.mark.parametrize("use_pyarrow", [True, False])
 @pytest.mark.write_disk
 def test_scan_delta_use_pyarrow(tmp_path: Path, use_pyarrow: bool) -> None:
